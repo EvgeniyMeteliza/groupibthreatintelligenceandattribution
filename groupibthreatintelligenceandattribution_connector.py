@@ -6,16 +6,18 @@
 # Python 3 Compatibility imports
 from __future__ import print_function, unicode_literals
 
+import json
+from datetime import datetime, timedelta
+
 # Phantom App imports
 import phantom.app as phantom
-from phantom.base_connector import BaseConnector
+import requests
+from dateparser import parse
 from phantom.action_result import ActionResult
+from phantom.base_connector import BaseConnector
+from pytia import TIAPoller
 
 from groupibthreatintelligenceandattribution_consts import *
-import requests
-from pytia import TIAPoller
-from dateparser import parse
-import json
 
 
 class RetVal(tuple):
@@ -67,10 +69,11 @@ class GroupIbThreatIntelligenceAndAttributionConnector(BaseConnector):
         self._gib_tia_connector.set_keys(collection_name, keys)
 
         if collection_name == "compromised/breached":
-            if not last_fetch:
-                last_fetch = date_start
+            if last_fetch:
+                date_start = last_fetch.get("date_start")
+                date_end = last_fetch.get("date_end")
             generator = self._gib_tia_connector.create_search_generator(collection_name=collection_name,
-                                                                        date_from=last_fetch,
+                                                                        date_from=date_start,
                                                                         date_to=date_end)
         else:
             generator = self._gib_tia_connector.create_update_generator(collection_name=collection_name,
@@ -164,29 +167,31 @@ class GroupIbThreatIntelligenceAndAttributionConnector(BaseConnector):
         self.save_progress("Test Connectivity Passed")
         return action_result.set_status(phantom.APP_SUCCESS)
 
-    def _on_poll(self, param):
-        is_manual_poll = self.is_poll_now()
+    def _manual_on_poll(self, param):
         action_result = self.add_action_result(ActionResult(dict(param)))
         action_result.set_status(phantom.APP_SUCCESS)
         container_count = 0
         artifacts_count = 0
         flag = 0
 
-        for collection_name, date_start in self._collections.items():
-            self.debug_print('Starting polling process for {0} collection'.format(collection_name))
-            self.save_progress('Starting polling process for {0} collection'.format(collection_name))
+        if not self._collections:
+            message = 'No configuration has been done for on_poll action. ' \
+                      'Please select the proper configuration parameter'
+            self.debug_print(message)
+            self.save_progress(message)
+            return action_result.set_status(phantom.APP_SUCCESS)
 
-            last_fetch = self._state.get(collection_name)
+        for collection_name, date_start in self._collections.items():
+            message = 'Starting polling process for {0} collection'.format(collection_name)
+            self.debug_print(message)
+            self.save_progress(message)
+
             try:
-                if is_manual_poll:
-                    start_time = parse(
-                        str(param.get('start_time'))).strftime(GIB_DATE_FORMAT) if param.get('start_time') else None
-                    end_time = parse(
-                        str(param.get('end_time'))).strftime(GIB_DATE_FORMAT) if param.get('end_time') else None
-                    generator, collection_info = self._setup_generator(collection_name, start_time, end_time)
-                else:
-                    generator, collection_info = self._setup_generator(collection_name, date_start,
-                                                                       last_fetch=last_fetch)
+                start_time = parse(
+                    str(param.get('start_time'))).strftime(GIB_DATE_FORMAT) if param.get('start_time') else None
+                end_time = parse(
+                    str(param.get('end_time'))).strftime(GIB_DATE_FORMAT) if param.get('end_time') else None
+                generator, collection_info = self._setup_generator(collection_name, start_time, end_time)
 
                 for chunk in generator:
                     portion = chunk.parse_portion()
@@ -198,7 +203,6 @@ class GroupIbThreatIntelligenceAndAttributionConnector(BaseConnector):
                         severity = self._transform_severity(feed)
                         feed["severity"] = severity
 
-                        last_fetch = feed.pop("last_fetch")
                         if feed.get('start_time'):
                             feed['start_time'] = parse(feed.get('start_time')).strftime(SPLUNK_DATE_FORMAT)
                         if feed.get('end_time'):
@@ -229,18 +233,14 @@ class GroupIbThreatIntelligenceAndAttributionConnector(BaseConnector):
                             message = """
                             Container for feed with id: {0} saved. ret_val: {1}, message: {2}, container_id: {3}.
                             """.format(container.get("source_data_identifier"), ret_val, message, container_id)
-                            if is_manual_poll:
-                                container_count += 1
-                                if container_count >= param.get('container_count', BASE_MAX_CONTAINERS_COUNT):
-                                    flag = 1
+                            container_count += 1
+                            if container_count >= param.get('container_count', BASE_MAX_CONTAINERS_COUNT):
+                                flag = 1
 
                         self.debug_print(message)
                         self.save_progress(message)
                         if phantom.is_fail(action_result.get_status()):
                             return action_result.get_status()
-
-                        if not is_manual_poll:
-                            self._state[collection_name] = last_fetch
 
                         artifacts = []
                         for artifact in artifacts_list[i]:
@@ -251,11 +251,10 @@ class GroupIbThreatIntelligenceAndAttributionConnector(BaseConnector):
                             artifacts.append({**artifact, **base_artifact,
                                               "container_id": container_id, "severity": severity})
 
-                            if is_manual_poll:
-                                artifacts_count += 1
-                                if artifacts_count >= param.get('artifact_count', BASE_MAX_ARTIFACTS_COUNT):
-                                    flag = 1
-                                    break
+                            artifacts_count += 1
+                            if artifacts_count >= param.get('artifact_count', BASE_MAX_ARTIFACTS_COUNT):
+                                flag = 1
+                                break
 
                         if artifacts:
                             ret_val, message, _ = self.save_artifacts(artifacts)
@@ -271,22 +270,138 @@ class GroupIbThreatIntelligenceAndAttributionConnector(BaseConnector):
                     if flag:
                         break
 
-                self.debug_print('Polling process for {0} collection has finished'.format(collection_name))
-                self.save_progress('Polling process for {0} collection has finished'.format(collection_name))
+                message = 'Polling process for {0} collection has finished'.format(collection_name)
+                self.debug_print(message)
+                self.save_progress(message)
+
                 if flag:
                     break
             except Exception as e:
                 err_msg = self._get_error_message_from_exception(e)
                 return action_result.set_status(phantom.APP_ERROR, err_msg)
-        else:
-            self.debug_print('No collections have been configured for on_poll action.'
-                             'Please set up the proper configuration parameters')
-            self.save_progress('No collections have been configured for on_poll action.'
-                               'Please set up the proper configuration parameters')
+
+        message = 'Polling process for all collections has finished'
+        self.debug_print(message)
+        self.save_progress(message)
+        return action_result.set_status(phantom.APP_SUCCESS)
+
+    def _on_poll(self, param):
+        is_manual_poll = self.is_poll_now()
+        if is_manual_poll:
+            return self._manual_on_poll(param)
+        action_result = self.add_action_result(ActionResult(dict(param)))
+        action_result.set_status(phantom.APP_SUCCESS)
+        if not self._collections:
+            message = 'No configuration has been done for on_poll action. ' \
+                      'Please select the proper configuration parameter'
+            self.debug_print(message)
+            self.save_progress(message)
             return action_result.set_status(phantom.APP_SUCCESS)
 
-        self.debug_print('Polling process for all collections has finished')
-        self.save_progress('Polling process for all collections has finished')
+        for collection_name, date_start in self._collections.items():
+            message = 'Starting polling process for {0} collection'.format(collection_name)
+            self.debug_print(message)
+            self.save_progress(message)
+
+            last_fetch = self._state.get(collection_name)
+            if collection_name == "compromised/breached":
+                if not isinstance(last_fetch, dict):
+                    date_end = datetime.now().strftime(GIB_DATE_FORMAT)
+                    last_fetch = {"date_start": date_start,
+                                  "starting_date_end": date_end,
+                                  "date_end": date_end}
+            try:
+                generator, collection_info = self._setup_generator(collection_name, date_start, last_fetch=last_fetch)
+
+                for chunk in generator:
+                    portion = chunk.parse_portion()
+                    artifacts_list = self._parse_artifacts(chunk, collection_info, collection_name)
+
+                    for i, feed in enumerate(portion):
+                        feed["name"] = "{0}: {1}".format(collection_info.get("prefix", ''), feed.get("name"))
+
+                        severity = self._transform_severity(feed)
+                        feed["severity"] = severity
+
+                        if collection_name == "compromised/breached":
+                            date_end = (parse(feed.pop("last_fetch")) - timedelta(seconds=1)).strftime(GIB_DATE_FORMAT)
+                            last_fetch.update({"date_end": date_end})
+                        else:
+                            last_fetch = feed.pop("last_fetch")
+                        if feed.get('start_time'):
+                            feed['start_time'] = parse(feed.get('start_time')).strftime(SPLUNK_DATE_FORMAT)
+                        if feed.get('end_time'):
+                            feed['end_time'] = parse(feed.get('end_time')).strftime(SPLUNK_DATE_FORMAT)
+
+                        container = {**feed, **BASE_CONTAINER}
+                        ret_val, message, container_id = self.save_container(container)
+                        base_artifact = BASE_ARTIFACT
+                        if message == 'Duplicate container found':
+                            duplication_container_info = self.get_container_info(container_id)
+                            status = duplication_container_info[1].get('status')
+                            if status in ["resolved", "closed"]:
+                                self.debug_print("Skipping adding artifacts to {0} container".format(status))
+                                continue
+
+                            base_artifact['label'] = "gib update indicator"
+                            message = """
+                            Container for feed with id: {0} already exists, updating data.
+                            ret_val: {1}, message: {2}, container_id: {3}
+                            """.format(container.get("source_data_identifier"), ret_val, message, container_id)
+                        elif phantom.is_fail(ret_val):
+                            message = """
+                            Error occurred while ingesting feed with id: {0} for {1} collection.
+                            Error: {2}. Aborting the polling process
+                            """.format(container.get("source_data_identifier"), collection_name, message)
+                            action_result.set_status(phantom.APP_ERROR, message)
+                        else:
+                            message = """
+                            Container for feed with id: {0} saved. ret_val: {1}, message: {2}, container_id: {3}.
+                            """.format(container.get("source_data_identifier"), ret_val, message, container_id)
+
+                        self.debug_print(message)
+                        self.save_progress(message)
+                        if phantom.is_fail(action_result.get_status()):
+                            return action_result.get_status()
+
+                        self._state[collection_name] = last_fetch
+
+                        artifacts = []
+                        for artifact in artifacts_list[i]:
+                            if artifact.get('start_time'):
+                                artifact['start_time'] = parse(artifact.get('start_time')).strftime(SPLUNK_DATE_FORMAT)
+                            if artifact.get('end_time'):
+                                artifact['end_time'] = parse(artifact.get('end_time')).strftime(SPLUNK_DATE_FORMAT)
+                            artifacts.append({**artifact, **base_artifact,
+                                              "container_id": container_id, "severity": severity})
+
+                        if artifacts:
+                            ret_val, message, _ = self.save_artifacts(artifacts)
+                            message = """
+                            Status {0} for ingesting artifacts for container with id: {1} for {2} collection.
+                            Message: {3}""".format(ret_val, container_id, collection_name, message)
+                            self.debug_print(message)
+                            self.save_progress(message)
+
+                message = 'Polling process for {0} collection has finished'.format(collection_name)
+                self.debug_print(message)
+                self.save_progress(message)
+                if collection_name == "compromised/breached":
+                    date_start = (
+                            parse(last_fetch.get("starting_date_end")) + timedelta(seconds=1)
+                    ).strftime(GIB_DATE_FORMAT)
+                    starting_date_end = datetime.now().strftime(GIB_DATE_FORMAT)
+                    self._state[collection_name] = {"date_start": date_start,
+                                                    "date_end": starting_date_end,
+                                                    "starting_date_end": starting_date_end}
+
+            except Exception as e:
+                err_msg = self._get_error_message_from_exception(e)
+                return action_result.set_status(phantom.APP_ERROR, err_msg)
+
+        message = 'Polling process for all collections has finished'
+        self.debug_print(message)
+        self.save_progress(message)
         return action_result.set_status(phantom.APP_SUCCESS)
 
     def handle_action(self, param):
@@ -351,8 +466,9 @@ class GroupIbThreatIntelligenceAndAttributionConnector(BaseConnector):
 
 
 def main():
-    import pudb
     import argparse
+
+    import pudb
 
     pudb.set_trace()
 
